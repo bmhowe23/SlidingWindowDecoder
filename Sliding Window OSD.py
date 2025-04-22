@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[3]:
+# In[1]:
 
 
 get_ipython().run_line_magic('reload_ext', 'autoreload')
@@ -20,13 +20,14 @@ from src.utils import rank
 from src.codes_q import create_bivariate_bicycle_codes, create_circulant_matrix
 from src.build_circuit import build_circuit, dem_to_check_matrices
 from src import osd_window
+import cudaq_qec as qec
 
 
-# In[13]:
+# In[16]:
 
 
 decoding_time = []
-def sliding_window_decoder(N, p=0.003, num_repeat=12, num_shots=10000, max_iter=200, W=2, F=1, z_basis=True, noisy_prior=None, method=0, plot=False, shorten=False):
+def sliding_window_decoder(N, p=0.003, num_repeat=12, num_shots=10000, max_iter=200, W=2, F=1, z_basis=True, noisy_prior=None, method=0, plot=False, shorten=False, use_nv_decoder=False):
 
     if N == 72:
         code, A_list, B_list = create_bivariate_bicycle_codes(6, 6, [3], [1,2], [1,2], [3]) # 72
@@ -153,17 +154,31 @@ def sliding_window_decoder(N, p=0.003, num_repeat=12, num_shots=10000, max_iter=
         b = anchors[bottom_right]
         c = anchors[top_left+F] # commit region bottom right
         if not shorten:
-            bpd = bposd_decoder(
-                mat, # the parity check matrix
-                error_rate=p, # does not matter because channel_probs is assigned
-                channel_probs=prior, # assign error_rate to each qubit. This will override "error_rate" input variable
-                max_iter=max_iter, # the maximum number of iterations for BP)
-                bp_method="minimum_sum_log",
-                ms_scaling_factor=1.0, # min sum scaling factor. If set to zero the variable scaling factor method is used
-                osd_method="osd_cs",
-                osd_order=10, # -1 for no osd (only BP)
-                input_vector_type="syndrome",
-            )
+            if use_nv_decoder:
+                nvdecargs =  {
+                    "max_iterations:": max_iter,
+                    "error_rate_vec": prior,
+                    "use_sparsity": True,
+                    "use_osd": True,
+                    "osd_order": 10,
+                    "osd_method": 3,
+                    "bp_batch_size": 1000
+                }
+                cmat = np.array(mat, order="C")
+                bpd = qec.get_decoder("nv-qldpc-decoder", cmat, **nvdecargs)
+            else:
+                bpd = bposd_decoder(
+                    mat, # the parity check matrix
+                    error_rate=p, # does not matter because channel_probs is assigned
+                    channel_probs=prior, # assign error_rate to each qubit. This will override "error_rate" input variable
+                    max_iter=max_iter, # the maximum number of iterations for BP)
+                    bp_method="product_sum",
+                    #bp_method="minimum_sum",
+                    ms_scaling_factor=1.0, # min sum scaling factor. If set to zero the variable scaling factor method is used
+                    osd_method="osd_cs",
+                    osd_order=10, # -1 for no osd (only BP)
+                    #input_vector_type="syndrome",
+                )
         else: # run my version of OSD
             # if after `pre_max_iter` BP iterations on the original PCM but not converged
             # sort according to sum of the recent four posterior_llr from low to high
@@ -184,18 +199,32 @@ def sliding_window_decoder(N, p=0.003, num_repeat=12, num_shots=10000, max_iter=
         num_flag_err = 0
 
         detector_win = new_det_data[:,a[0]:b[0]]
-        for j in range(num_shots):
+        if use_nv_decoder:
             decoding_start_time = time.perf_counter()
-            e_hat = bpd.decode(detector_win[j])
+            e_hat = bpd.decode_batch(detector_win)
             decoding_end_time = time.perf_counter()
-            # if shorten: print(f"pm: {bpd.min_pm}")
-            decoding_time.append(decoding_end_time-decoding_start_time)
-            is_flagged = ((mat @ e_hat + detector_win[j]) % 2).any()
-            num_flag_err += is_flagged
-            if i == num_win-1: # last window
-                total_e_hat[j][a[1]:b[1]] = e_hat
-            else:
-                total_e_hat[j][a[1]:c[1]] = e_hat[:c[1]-a[1]]
+            for j in range(num_shots):
+                # if shorten: print(f"pm: {bpd.min_pm}")
+                decoding_time.append((decoding_end_time-decoding_start_time)/num_shots)
+                is_flagged = ((mat @ e_hat[j].result + detector_win[j]) % 2).any()
+                num_flag_err += is_flagged
+                if i == num_win-1: # last window
+                    total_e_hat[j][a[1]:b[1]] = e_hat[j].result
+                else:
+                    total_e_hat[j][a[1]:c[1]] = e_hat[j].result[:c[1]-a[1]]
+        else:
+            for j in range(num_shots):
+                decoding_start_time = time.perf_counter()
+                e_hat = bpd.decode(detector_win[j])
+                decoding_end_time = time.perf_counter()
+                # if shorten: print(f"pm: {bpd.min_pm}")
+                decoding_time.append(decoding_end_time-decoding_start_time)
+                is_flagged = ((mat @ e_hat + detector_win[j]) % 2).any()
+                num_flag_err += is_flagged
+                if i == num_win-1: # last window
+                    total_e_hat[j][a[1]:b[1]] = e_hat
+                else:
+                    total_e_hat[j][a[1]:c[1]] = e_hat[:c[1]-a[1]]
           
 
         print(f"Window {i}, flagged Errors: {num_flag_err}/{num_shots}")
@@ -219,16 +248,26 @@ def sliding_window_decoder(N, p=0.003, num_repeat=12, num_shots=10000, max_iter=
     print("logical error per round:", p_l_per_round)
 
 
-# In[14]:
+# In[17]:
 
 
-sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=3, F=1, num_shots=10000, max_iter=200, method=1, 
+sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=3, F=1, num_shots=1000, max_iter=200, method=1, 
                        z_basis=True)
 
 plt.hist([x*1000 for x in decoding_time]) # convert s to ms
 
 
-# In[11]:
+# In[18]:
+
+
+# Use nv-qldpc-decoder
+sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=3, F=1, num_shots=1000, max_iter=200, method=1, 
+                       z_basis=True, use_nv_decoder=True)
+
+plt.hist([x*1000 for x in decoding_time]) # convert s to ms
+
+
+# In[ ]:
 
 
 sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=3, F=1, num_shots=10000, max_iter=200, method=1, 
@@ -237,7 +276,7 @@ sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=3, F=1, num_shots=10000,
 plt.hist([x*1000 for x in decoding_time]) # convert s to ms
 
 
-# In[21]:
+# In[ ]:
 
 
 sliding_window_decoder(N=288, p=0.005, num_repeat=6, W=4, F=1, num_shots=10000, max_iter=200, method=1, z_basis=True)
@@ -245,43 +284,43 @@ sliding_window_decoder(N=288, p=0.005, num_repeat=6, W=4, F=1, num_shots=10000, 
 # logical error rate per round 6.8e-4
 
 
-# In[20]:
+# In[ ]:
 
 
 sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=3, F=1, num_shots=10000, max_iter=200, method=1, z_basis=True, plot=True)
 
 
-# In[21]:
+# In[ ]:
 
 
 sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=4, F=1, num_shots=10000, max_iter=200, method=1, z_basis=True, plot=True)
 
 
-# In[22]:
+# In[ ]:
 
 
 sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=5, F=1, num_shots=10000, max_iter=200, method=1, z_basis=True, plot=True)
 
 
-# In[30]:
+# In[ ]:
 
 
 sliding_window_decoder(N=144, p=0.004, num_repeat=12, W=5, F=2, num_shots=10000, max_iter=200, method=1, z_basis=False, plot=True)
 
 
-# In[23]:
+# In[ ]:
 
 
 sliding_window_decoder(N=144, p=0.003, num_repeat=12, W=3, F=1, num_shots=100000, max_iter=200, method=1, z_basis=True)
 
 
-# In[24]:
+# In[ ]:
 
 
 sliding_window_decoder(N=144, p=0.003, num_repeat=12, W=4, F=1, num_shots=100000, max_iter=200, method=1, z_basis=True)
 
 
-# In[25]:
+# In[ ]:
 
 
 sliding_window_decoder(N=144, p=0.003, num_repeat=12, W=5, F=1, num_shots=100000, max_iter=200, method=1, z_basis=True)
